@@ -266,7 +266,7 @@ def save_results(data, filename):
             for item in data:
                 f.write(str(item) + '\n')
         elif isinstance(data, dict):
-            json.dump(data, f, indent=2)
+            json.dump(list(all_domains), f)
         else:
             f.write(str(data))
     return filename
