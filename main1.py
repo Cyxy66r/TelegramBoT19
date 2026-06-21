@@ -1,32 +1,37 @@
 #!/usr/bin/env python3
-# Domain Scraper Telegram Bot v5.0
-# Scrapes domains from multiple sources
+# BugScanX - Advanced Domain Scanner Bot v3.0
+# Complete All-in-One Scanner
 
 import os
 import sys
 import json
-import time
 import re
+import time
+import socket
 import asyncio
 import aiohttp
+import ipaddress
 import random
-from datetime import datetime, timedelta
-from collections import defaultdict
+import subprocess
+from datetime import datetime
+from colorama import init, Fore, Style
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from telegram.constants import ParseMode
 import requests
 from bs4 import BeautifulSoup
-from colorama import init, Fore, Style
+from tqdm import tqdm
+import dns.resolver
 
 init(autoreset=True)
 
 # === CONFIGURATION ===
 BOT_TOKEN = "8919629019:AAHD2e7b5L7LKshB6-5lCVG5V0r1I__J5YQ"  # Replace with your bot token
 ADMIN_IDS = [5889605682]  # Replace with your Telegram ID
-CHANNEL_ID = "@your_channel"  # Optional
+OUTPUT_DIR = "scans"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Sources
+# === SOURCES ===
 SOURCES = {
     'crt.sh': {
         'url': 'https://crt.sh/?q=%25.{domain}&output=json',
@@ -51,35 +56,35 @@ SOURCES = {
     'wayback': {
         'url': 'https://web.archive.org/cdx/search/cdx?url=*.{domain}/*&output=json&fl=original&collapse=urlkey',
         'parser': 'json'
+    },
+    'dnsdumpster': {
+        'url': 'https://dnsdumpster.com/',
+        'parser': 'html'
+    },
+    'rapiddns': {
+        'url': 'https://rapiddns.io/subdomain/{domain}?full=1',
+        'parser': 'html'
+    },
+    'bufferover': {
+        'url': 'https://dns.bufferover.run/dns?q={domain}',
+        'parser': 'json'
+    },
+    'netcraft': {
+        'url': 'https://searchdns.netcraft.com/?restriction=site+contains&host={domain}',
+        'parser': 'html'
     }
 }
 
-PROXY_FILE = "proxies.txt"
-OUTPUT_DIR = "scraped_domains"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+COMMON_PORTS = [21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 993, 995, 1723, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 27017]
 
 # === UTILITY FUNCTIONS ===
 
-def load_proxies():
-    """Load proxies from file"""
-    if os.path.exists(PROXY_FILE):
-        with open(PROXY_FILE, 'r') as f:
-            return [line.strip() for line in f if line.strip()]
-    return []
-
-def get_random_proxy():
-    """Get random proxy from list"""
-    proxies = load_proxies()
-    if proxies:
-        return random.choice(proxies)
-    return None
-
-def parse_domains_from_text(text):
+def parse_domains(text):
     """Extract domains from text"""
     pattern = re.compile(r'[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+')
     return list(set(pattern.findall(text)))
 
-def parse_domains_from_json(data):
+def parse_json_domains(data):
     """Extract domains from JSON"""
     domains = set()
     try:
@@ -106,69 +111,78 @@ def parse_domains_from_json(data):
         pass
     return domains
 
+def ip_to_domain(ip):
+    """Convert IP to domain using reverse DNS"""
+    try:
+        domain = socket.gethostbyaddr(ip)[0]
+        return domain
+    except:
+        return None
+
+def cidr_to_ips(cidr):
+    """Convert CIDR to list of IPs"""
+    try:
+        network = ipaddress.ip_network(cidr, strict=False)
+        return [str(ip) for ip in network.hosts()]
+    except:
+        return []
+
+def scan_port(ip, port, timeout=2):
+    """Scan a single port"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((ip, port))
+        sock.close()
+        return result == 0
+    except:
+        return False
+
+def is_alive(domain):
+    """Check if domain is alive"""
+    try:
+        socket.gethostbyname(domain)
+        return True
+    except:
+        return False
+
 # === SCRAPING FUNCTIONS ===
 
-async def scrape_source(session, source_name, source_data, domain, proxy=None):
+async def scrape_source(session, source_name, source_data, domain):
     """Scrape domains from a single source"""
     domains = set()
     try:
         url = source_data['url'].format(domain=domain)
-        headers = {'User-Agent': random.choice([
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
-        ])}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         
-        # Use proxy if available
-        if proxy:
-            proxy_url = f"http://{proxy}" if not proxy.startswith('http') else proxy
-            timeout = aiohttp.ClientTimeout(total=30)
-            async with session.get(url, headers=headers, proxy=proxy_url, timeout=timeout) as resp:
-                if resp.status == 200:
-                    data = await resp.text()
-                    
-                    # Parse based on source type
-                    if source_data['parser'] == 'json':
-                        try:
-                            json_data = await resp.json()
-                            domains = parse_domains_from_json(json_data)
-                        except:
-                            pass
-                    elif source_data['parser'] == 'text':
-                        domains = parse_domains_from_text(data)
-                    else:  # html
-                        domains = parse_domains_from_text(data)
-        else:
-            # Direct request
-            timeout = aiohttp.ClientTimeout(total=30)
-            async with session.get(url, headers=headers, timeout=timeout) as resp:
-                if resp.status == 200:
-                    data = await resp.text()
-                    if source_data['parser'] == 'json':
-                        try:
-                            json_data = await resp.json()
-                            domains = parse_domains_from_json(json_data)
-                        except:
-                            pass
-                    elif source_data['parser'] == 'text':
-                        domains = parse_domains_from_text(data)
-                    else:
-                        domains = parse_domains_from_text(data)
+        async with session.get(url, headers=headers, timeout=30) as resp:
+            if resp.status == 200:
+                if source_data['parser'] == 'json':
+                    try:
+                        data = await resp.json()
+                        domains = parse_json_domains(data)
+                    except:
+                        pass
+                elif source_data['parser'] == 'text':
+                    text = await resp.text()
+                    domains = parse_domains(text)
+                else:
+                    text = await resp.text()
+                    domains = parse_domains(text)
         
         return source_name, domains, None
     except Exception as e:
         return source_name, set(), str(e)
 
-async def scrape_all_sources(domain, use_proxy=True):
-    """Scrape all sources for a domain"""
+async def scrape_domains(domain):
+    """Scrape domains from all sources"""
     all_domains = set()
     results = {}
-    proxy = get_random_proxy() if use_proxy else None
     
     async with aiohttp.ClientSession() as session:
         tasks = []
         for source_name, source_data in SOURCES.items():
-            task = scrape_source(session, source_name, source_data, domain, proxy)
+            task = scrape_source(session, source_name, source_data, domain)
             tasks.append(task)
         
         for task in asyncio.as_completed(tasks):
@@ -178,51 +192,83 @@ async def scrape_all_sources(domain, use_proxy=True):
     
     return all_domains, results
 
+# === CIDR TO DOMAIN ===
+
+def cidr_to_domain(cidr):
+    """Convert CIDR to domains"""
+    ips = cidr_to_ips(cidr)
+    domains = []
+    for ip in ips[:100]:  # Limit to 100 IPs
+        domain = ip_to_domain(ip)
+        if domain:
+            domains.append(domain)
+    return domains
+
+# === PORT SCANNER ===
+
+def port_scan(target, ports=COMMON_PORTS):
+    """Scan ports on target"""
+    open_ports = []
+    for port in ports:
+        if scan_port(target, port):
+            open_ports.append(port)
+    return open_ports
+
+# === SUBDOMAIN HUNTER ===
+
+async def subdomain_hunter(domain):
+    """Find subdomains using multiple techniques"""
+    all_subdomains = set()
+    
+    # Method 1: crt.sh
+    try:
+        resp = requests.get(f"https://crt.sh/?q=%25.{domain}&output=json", timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            for item in data:
+                name = item.get('name_value', '')
+                if name and not name.startswith('*'):
+                    all_subdomains.add(name.lower())
+    except:
+        pass
+    
+    # Method 2: SecurityTrails
+    try:
+        resp = requests.get(f"https://securitytrails.com/domain/{domain}/subdomains", timeout=30)
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            text = soup.get_text()
+            domains = parse_domains(text)
+            all_subdomains.update(domains)
+    except:
+        pass
+    
+    # Method 3: AlienVault
+    try:
+        resp = requests.get(f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns", timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            for item in data.get('passive_dns', []):
+                host = item.get('hostname', '')
+                if host:
+                    all_subdomains.add(host.lower())
+    except:
+        pass
+    
+    return list(all_subdomains)
+
 # === SAVE FUNCTIONS ===
 
-def save_domains(domains, domain, format='txt'):
-    """Save domains to file"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{OUTPUT_DIR}/{domain}_{timestamp}.{format}"
-    
-    if format == 'txt':
-        with open(filename, 'w') as f:
-            for d in sorted(domains):
-                f.write(d + '\n')
-    elif format == 'csv':
-        with open(filename, 'w') as f:
-            f.write("domain\n")
-            for d in sorted(domains):
-                f.write(d + '\n')
-    elif format == 'json':
-        with open(filename, 'w') as f:
-            json.dump(sorted(domains), f, indent=2)
-    
-    return filename
-
-def save_results(domain, all_domains, results):
-    """Save detailed results"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{OUTPUT_DIR}/{domain}_{timestamp}_detailed.json"
-    
-    data = {
-        'domain': domain,
-        'timestamp': timestamp,
-        'total_domains': len(all_domains),
-        'sources': {},
-        'all_domains': sorted(all_domains)
-    }
-    
-    for source_name, result in results.items():
-        data['sources'][source_name] = {
-            'count': len(result['domains']),
-            'error': result['error'],
-            'domains': sorted(result['domains'])
-        }
-    
+def save_results(data, filename):
+    """Save results to file"""
     with open(filename, 'w') as f:
-        json.dump(data, f, indent=2)
-    
+        if isinstance(data, list):
+            for item in data:
+                f.write(str(item) + '\n')
+        elif isinstance(data, dict):
+            json.dump(data, f, indent=2)
+        else:
+            f.write(str(data))
     return filename
 
 # === TELEGRAM BOT HANDLERS ===
@@ -231,38 +277,43 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command"""
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        await update.message.reply_text("🚫 You are not authorized to use this bot.")
+        await update.message.reply_text("🚫 Unauthorized.")
         return
     
     keyboard = [
-        [InlineKeyboardButton("🌐 Scrape Domain", callback_data='scrape')],
-        [InlineKeyboardButton("📊 View Stats", callback_data='stats')],
-        [InlineKeyboardButton("📁 Last Results", callback_data='last_results')],
-        [InlineKeyboardButton("⚙️ Settings", callback_data='settings')],
-        [InlineKeyboardButton("🔄 Refresh Sources", callback_data='refresh_sources')],
-        [InlineKeyboardButton("📥 Download Proxies", callback_data='download_proxies')],
+        [InlineKeyboardButton("🌐 Domain Scanner", callback_data='domain_scanner')],
+        [InlineKeyboardButton("🔍 CIDR to Domain", callback_data='cidr_to_domain')],
+        [InlineKeyboardButton("🎯 Subdomain Hunter", callback_data='subdomain_hunter')],
+        [InlineKeyboardButton("🔌 Port Scanner", callback_data='port_scanner')],
+        [InlineKeyboardButton("📊 Bulk Scanner", callback_data='bulk_scanner')],
+        [InlineKeyboardButton("📁 My Scans", callback_data='my_scans')],
         [InlineKeyboardButton("ℹ️ Help", callback_data='help')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        f"🤖 *Domain Scraper Bot v5.0*\n\n"
+        f"🔥 *BugScanX v3.0*\n\n"
         f"📌 *Features:*\n"
-        f"• Scrape from {len(SOURCES)} sources\n"
-        f"• Proxy support\n"
-        f"• Multiple output formats\n"
-        f"• Rate limit handling\n\n"
+        f"• 🌐 Domain Scanner (10+ Sources)\n"
+        f"• 🔍 CIDR to Domain Converter\n"
+        f"• 🎯 Subdomain Hunter\n"
+        f"• 🔌 Port Scanner (Common Ports)\n"
+        f"• 📊 Bulk Scanner\n"
+        f"• 📁 Export Results (TXT/JSON)\n\n"
         f"🔧 *Commands:*\n"
-        f"/scrape <domain> - Scrape domains\n"
+        f"/scan <domain> - Scan domain\n"
+        f"/cidr <cidr> - Convert CIDR\n"
+        f"/subdomains <domain> - Hunt subdomains\n"
+        f"/ports <host> - Scan ports\n"
+        f"/bulk - Bulk scan mode\n"
         f"/status - Check bot status\n"
-        f"/help - Show help\n\n"
-        f"Select an option below:",
+        f"/help - Show help",
         reply_markup=reply_markup,
         parse_mode=ParseMode.MARKDOWN
     )
 
-async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Scrape command"""
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Domain scan command"""
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
         await update.message.reply_text("🚫 Unauthorized.")
@@ -270,47 +321,55 @@ async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not context.args:
         await update.message.reply_text(
-            "❌ *Usage:* `/scrape <domain>`\n"
-            "Example: `/scrape example.com`",
+            "❌ *Usage:* `/scan <domain>`\n"
+            "Example: `/scan example.com`",
             parse_mode=ParseMode.MARKDOWN
         )
         return
     
     domain = context.args[0].lower()
-    
-    # Send initial message
-    msg = await update.message.reply_text(
-        f"🔍 *Scraping domains for:* `{domain}`\n"
-        f"⏳ Please wait...",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    msg = await update.message.reply_text(f"🔍 *Scanning:* `{domain}`\n⏳ Please wait...", parse_mode=ParseMode.MARKDOWN)
     
     try:
-        # Scrape all sources
-        all_domains, results = await scrape_all_sources(domain)
+        # Scrape domains
+        all_domains, results = await scrape_domains(domain)
+        
+        # Check live status
+        live_domains = []
+        for d in all_domains:
+            if is_alive(d):
+                live_domains.append(d)
         
         # Save results
-        txt_file = save_domains(all_domains, domain, 'txt')
-        json_file = save_results(domain, all_domains, results)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        txt_file = f"{OUTPUT_DIR}/{domain}_{timestamp}.txt"
+        json_file = f"{OUTPUT_DIR}/{domain}_{timestamp}.json"
         
-        # Prepare response
-        response = f"✅ *Scraping Complete!*\n\n"
+        save_results(all_domains, txt_file)
+        save_results({
+            'domain': domain,
+            'timestamp': timestamp,
+            'total': len(all_domains),
+            'live': len(live_domains),
+            'sources': {k: len(v['domains']) for k, v in results.items() if not v['error']},
+            'results': results,
+            'all_domains': sorted(all_domains)
+        }, json_file)
+        
+        # Response
+        response = f"✅ *Scan Complete!*\n\n"
         response += f"📌 *Domain:* `{domain}`\n"
-        response += f"🌐 *Total Domains Found:* {len(all_domains)}\n"
-        response += f"📊 *Sources Used:* {len([s for s in results if not results[s]['error']])}/{len(SOURCES)}\n\n"
+        response += f"🌐 *Total Domains:* {len(all_domains)}\n"
+        response += f"✅ *Live:* {len(live_domains)}\n"
+        response += f"📊 *Sources:* {len([s for s in results if not results[s]['error']])}/{len(SOURCES)}\n\n"
         
         response += "*Source Breakdown:*\n"
         for source_name, result in results.items():
             if result['error']:
-                response += f"❌ {source_name}: Error - {result['error'][:30]}\n"
+                response += f"❌ {source_name}: Error\n"
             else:
                 response += f"✅ {source_name}: {len(result['domains'])} domains\n"
         
-        response += f"\n📁 *Files Saved:*\n"
-        response += f"• `{txt_file}`\n"
-        response += f"• `{json_file}`\n"
-        
-        # Add first 10 domains as sample
         if all_domains:
             response += f"\n📝 *Sample Domains (First 10):*\n"
             for d in sorted(all_domains)[:10]:
@@ -318,14 +377,9 @@ async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(all_domains) > 10:
                 response += f"• ... and {len(all_domains)-10} more\n"
         
-        # Update message
-        await msg.edit_text(
-            response,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True
-        )
+        await msg.edit_text(response, parse_mode=ParseMode.MARKDOWN)
         
-        # Also send file
+        # Send file
         with open(txt_file, 'rb') as f:
             await update.message.reply_document(
                 document=f,
@@ -334,10 +388,229 @@ async def scrape_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         
     except Exception as e:
-        await msg.edit_text(
-            f"❌ *Error:* {str(e)}",
+        await msg.edit_text(f"❌ *Error:* {str(e)}", parse_mode=ParseMode.MARKDOWN)
+
+async def cidr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """CIDR to domain command"""
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("🚫 Unauthorized.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "❌ *Usage:* `/cidr <cidr>`\n"
+            "Example: `/cidr 192.168.1.0/24`",
             parse_mode=ParseMode.MARKDOWN
         )
+        return
+    
+    cidr = context.args[0]
+    msg = await update.message.reply_text(f"🔍 *Converting:* `{cidr}`\n⏳ Please wait...", parse_mode=ParseMode.MARKDOWN)
+    
+    try:
+        domains = cidr_to_domain(cidr)
+        
+        response = f"✅ *CIDR to Domain Complete!*\n\n"
+        response += f"📌 *CIDR:* `{cidr}`\n"
+        response += f"🌐 *Domains Found:* {len(domains)}\n\n"
+        
+        if domains:
+            response += "*Domains:*\n"
+            for d in domains[:20]:
+                response += f"• `{d}`\n"
+            if len(domains) > 20:
+                response += f"• ... and {len(domains)-20} more\n"
+            
+            # Save
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{OUTPUT_DIR}/cidr_{cidr.replace('/', '_')}_{timestamp}.txt"
+            save_results(domains, filename)
+            
+            with open(filename, 'rb') as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=os.path.basename(filename),
+                    caption=f"📁 *CIDR Domains:* `{cidr}`"
+                )
+        
+        await msg.edit_text(response, parse_mode=ParseMode.MARKDOWN)
+        
+    except Exception as e:
+        await msg.edit_text(f"❌ *Error:* {str(e)}", parse_mode=ParseMode.MARKDOWN)
+
+async def subdomains_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Subdomain hunter command"""
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("🚫 Unauthorized.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "❌ *Usage:* `/subdomains <domain>`\n"
+            "Example: `/subdomains example.com`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    domain = context.args[0].lower()
+    msg = await update.message.reply_text(f"🎯 *Hunting subdomains for:* `{domain}`\n⏳ Please wait...", parse_mode=ParseMode.MARKDOWN)
+    
+    try:
+        subdomains = await subdomain_hunter(domain)
+        
+        response = f"✅ *Subdomain Hunt Complete!*\n\n"
+        response += f"📌 *Domain:* `{domain}`\n"
+        response += f"🎯 *Subdomains Found:* {len(subdomains)}\n\n"
+        
+        if subdomains:
+            response += "*Subdomains:*\n"
+            for s in subdomains[:20]:
+                response += f"• `{s}`\n"
+            if len(subdomains) > 20:
+                response += f"• ... and {len(subdomains)-20} more\n"
+            
+            # Save
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{OUTPUT_DIR}/subdomains_{domain}_{timestamp}.txt"
+            save_results(subdomains, filename)
+            
+            with open(filename, 'rb') as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=os.path.basename(filename),
+                    caption=f"📁 *Subdomains for:* `{domain}`"
+                )
+        
+        await msg.edit_text(response, parse_mode=ParseMode.MARKDOWN)
+        
+    except Exception as e:
+        await msg.edit_text(f"❌ *Error:* {str(e)}", parse_mode=ParseMode.MARKDOWN)
+
+async def ports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Port scanner command"""
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("🚫 Unauthorized.")
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "❌ *Usage:* `/ports <host>`\n"
+            "Example: `/ports example.com`\n"
+            "Or: `/ports 192.168.1.1`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    target = context.args[0]
+    msg = await update.message.reply_text(f"🔌 *Scanning ports on:* `{target}`\n⏳ Please wait...", parse_mode=ParseMode.MARKDOWN)
+    
+        try:
+        # Resolve domain to IP if needed
+        if not re.match(r'^\d+\.\d+\.\d+\.\d+$', target):
+            ip = socket.gethostbyname(target)
+        else:
+            ip = target
+        
+        open_ports = port_scan(ip)
+        
+        response = f"✅ *Port Scan Complete!*\n\n"
+        response += f"📌 *Target:* `{target}`\n"
+        response += f"🖥️ *IP:* `{ip}`\n"
+        response += f"🔌 *Open Ports:* {len(open_ports)}\n\n"
+        
+        if open_ports:
+            response += "*Open Ports:*\n"
+            for port in open_ports:
+                response += f"• `{port}`\n"
+        else:
+            response += "❌ *No open ports found*\n"
+        
+        # Save
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{OUTPUT_DIR}/ports_{target}_{timestamp}.txt"
+        save_results(open_ports, filename)
+        
+        with open(filename, 'rb') as f:
+            await update.message.reply_document(
+                document=f,
+                filename=os.path.basename(filename),
+                caption=f"📁 *Ports for:* `{target}`"
+            )
+        
+        await msg.edit_text(response, parse_mode=ParseMode.MARKDOWN)
+        
+    except Exception as e:
+        await msg.edit_text(f"❌ *Error:* {str(e)}", parse_mode=ParseMode.MARKDOWN)
+
+async def bulk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bulk scanner command"""
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("🚫 Unauthorized.")
+        return
+    
+    await update.message.reply_text(
+        "📊 *Bulk Scanner Mode*\n\n"
+        "Send me a list of domains (one per line).\n"
+        "Example:\n"
+        "example.com\n"
+        "google.com\n"
+        "github.com\n\n"
+        "Or upload a TXT file."
+    )
+    context.user_data['bulk_mode'] = True
+
+async def handle_bulk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle bulk scan input"""
+    if not context.user_data.get('bulk_mode'):
+        return
+    
+    if update.message.document:
+        # Handle file upload
+        file = await update.message.document.get_file()
+        content = await file.download_as_bytearray()
+        domains = content.decode().strip().split('\n')
+    else:
+        # Handle text input
+        domains = update.message.text.strip().split('\n')
+    
+    domains = [d.strip() for d in domains if d.strip()]
+    context.user_data['bulk_mode'] = False
+    
+    msg = await update.message.reply_text(f"📊 *Bulk Scanning {len(domains)} domains...*\n⏳ Please wait...", parse_mode=ParseMode.MARKDOWN)
+    
+    results = {}
+    for domain in domains[:10]:  # Limit to 10
+        try:
+            all_domains, _ = await scrape_domains(domain)
+            live = [d for d in all_domains if is_alive(d)]
+            results[domain] = {'total': len(all_domains), 'live': len(live)}
+        except:
+            results[domain] = {'total': 0, 'live': 0, 'error': True}
+    
+    response = f"✅ *Bulk Scan Complete!*\n\n"
+    for domain, result in results.items():
+        if result.get('error'):
+            response += f"❌ {domain}: Error\n"
+        else:
+            response += f"✅ {domain}: {result['total']} domains, {result['live']} live\n"
+    
+    # Save
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{OUTPUT_DIR}/bulk_{timestamp}.json"
+    save_results(results, filename)
+    
+    with open(filename, 'rb') as f:
+        await update.message.reply_document(
+            document=f,
+            filename=os.path.basename(filename),
+            caption="📁 *Bulk Scan Results*"
+        )
+    
+    await msg.edit_text(response, parse_mode=ParseMode.MARKDOWN)
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Status command"""
@@ -346,44 +619,45 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚫 Unauthorized.")
         return
     
-    proxies = load_proxies()
-    
     status = f"📊 *Bot Status*\n\n"
-    status += f"✅ *Bot Running*\n"
+    status += f"✅ *Running*\n"
     status += f"📌 *Sources:* {len(SOURCES)}\n"
-    status += f"🔄 *Proxies:* {len(proxies)} loaded\n"
     status += f"📁 *Output Directory:* `{OUTPUT_DIR}`\n"
     status += f"⏰ *Uptime:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    
+    # Count files
+    files = os.listdir(OUTPUT_DIR) if os.path.exists(OUTPUT_DIR) else []
+    status += f"📄 *Files:* {len(files)}\n"
     
     await update.message.reply_text(status, parse_mode=ParseMode.MARKDOWN)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Help command"""
     help_text = f"""
-📚 *Domain Scraper Bot Help*
+📚 *BugScanX Help*
 
 🔹 *Commands:*
-• `/start` - Show main menu
-• `/scrape <domain>` - Scrape domains
+• `/scan <domain>` - Scan domain (10+ sources)
+• `/cidr <cidr>` - Convert CIDR to domains
+• `/subdomains <domain>` - Hunt subdomains
+• `/ports <host>` - Scan ports
+• `/bulk` - Bulk scan mode
 • `/status` - Check bot status
-• `/help` - Show this help
+• `/help` - Show help
 
-🔹 *How to use:*
-1. Send `/scrape example.com`
-2. Bot will scrape from {len(SOURCES)} sources
-3. Get results as TXT and JSON files
+🔹 *Features:*
+• 🌐 Multi-source domain scanning
+• 🔍 CIDR to domain conversion
+• 🎯 Subdomain discovery
+• 🔌 Port scanning
+• 📊 Bulk scanning
+• 📁 Export results
 
-🔹 *Sources:*
-{', '.join(SOURCES.keys())}
-
-🔹 *Output:*
-• TXT file - Raw domain list
-• JSON file - Detailed results
-
-🔹 *Tips:*
-• Use specific domains for better results
-• Results are cached locally
-• Proxy rotation helps avoid rate limits
+🔹 *Examples:*
+• `/scan example.com`
+• `/cidr 192.168.1.0/24`
+• `/subdomains example.com`
+• `/ports example.com`
 """
     await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
@@ -399,123 +673,82 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     data = query.data
     
-    if data == 'scrape':
+    if data == 'domain_scanner':
         await query.edit_message_text(
-            "📝 *Enter domain to scrape:*\n"
-            "Example: `example.com`",
+            "🌐 *Domain Scanner*\n\n"
+            "Send: `/scan <domain>`\n"
+            "Example: `/scan example.com`",
             parse_mode=ParseMode.MARKDOWN
         )
-        context.user_data['awaiting_domain'] = True
     
-    elif data == 'stats':
-        await status_command(update, context)
+    elif data == 'cidr_to_domain':
+        await query.edit_message_text(
+            "🔍 *CIDR to Domain*\n\n"
+            "Send: `/cidr <cidr>`\n"
+            "Example: `/cidr 192.168.1.0/24`",
+            parse_mode=ParseMode.MARKDOWN
+        )
     
-    elif data == 'last_results':
-        # List last 5 results
-        files = os.listdir(OUTPUT_DIR)
-        txt_files = [f for f in files if f.endswith('.txt')]
-        txt_files.sort(key=lambda x: os.path.getmtime(f"{OUTPUT_DIR}/{x}"), reverse=True)
-        
-        if txt_files:
-            response = f"📁 *Last 5 Results:*\n\n"
-            for f in txt_files[:5]:
+    elif data == 'subdomain_hunter':
+        await query.edit_message_text(
+            "🎯 *Subdomain Hunter*\n\n"
+            "Send: `/subdomains <domain>`\n"
+            "Example: `/subdomains example.com`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif data == 'port_scanner':
+        await query.edit_message_text(
+            "🔌 *Port Scanner*\n\n"
+            "Send: `/ports <host>`\n"
+            "Example: `/ports example.com`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif data == 'bulk_scanner':
+        await bulk_command(update, context)
+    
+    elif data == 'my_scans':
+        files = os.listdir(OUTPUT_DIR) if os.path.exists(OUTPUT_DIR) else []
+        if files:
+            response = f"📁 *My Scans ({len(files)} files)*\n\n"
+            for f in files[-10:]:
                 response += f"• `{f}`\n"
             await query.edit_message_text(response, parse_mode=ParseMode.MARKDOWN)
         else:
-            await query.edit_message_text("📁 *No results found.*")
-    
-    elif data == 'settings':
-        keyboard = [
-            [InlineKeyboardButton("🔧 Set Output Format", callback_data='set_format')],
-            [InlineKeyboardButton("🔄 Toggle Proxy", callback_data='toggle_proxy')],
-            [InlineKeyboardButton("📊 Show Stats", callback_data='stats')],
-            [InlineKeyboardButton("🔙 Back", callback_data='back_to_menu')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            "⚙️ *Settings*\n\n"
-            "Configure bot settings:",
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
-    elif data == 'refresh_sources':
-        await query.edit_message_text("🔄 *Refreshing sources...*")
-        # Re-load sources
-        await query.edit_message_text("✅ *Sources refreshed!*")
-    
-    elif data == 'download_proxies':
-        proxies = load_proxies()
-        if proxies:
-            filename = f"{OUTPUT_DIR}/proxies_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            with open(filename, 'w') as f:
-                for p in proxies:
-                    f.write(p + '\n')
-            
-            with open(filename, 'rb') as f:
-                await update.callback_query.message.reply_document(
-                    document=f,
-                    filename=os.path.basename(filename),
-                    caption=f"🔄 *Proxies* ({len(proxies)})"
-                )
-            await query.edit_message_text("📥 *Proxy list downloaded!*")
-        else:
-            await query.edit_message_text("❌ *No proxies found.*")
+            await query.edit_message_text("📁 *No scans found.*")
     
     elif data == 'help':
         await help_command(update, context)
-    
-    elif data == 'back_to_menu':
-        keyboard = [
-            [InlineKeyboardButton("🌐 Scrape Domain", callback_data='scrape')],
-            [InlineKeyboardButton("📊 View Stats", callback_data='stats')],
-            [InlineKeyboardButton("📁 Last Results", callback_data='last_results')],
-            [InlineKeyboardButton("⚙️ Settings", callback_data='settings')],
-            [InlineKeyboardButton("🔄 Refresh Sources", callback_data='refresh_sources')],
-            [InlineKeyboardButton("📥 Download Proxies", callback_data='download_proxies')],
-            [InlineKeyboardButton("ℹ️ Help", callback_data='help')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            "🤖 *Domain Scraper Bot*\n\n"
-            "Select an option:",
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.MARKDOWN
-        )
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle messages"""
-    if context.user_data.get('awaiting_domain'):
-        domain = update.message.text.strip().lower()
-        context.user_data['awaiting_domain'] = False
-        
-        # Simulate /scrape command
-        context.args = [domain]
-        await scrape_command(update, context)
+    await handle_bulk(update, context)
 
 # === MAIN ===
 
 def main():
-    """Main function"""
-    print(f"{Fore.GREEN}[✓] Starting Domain Scraper Bot...{Style.RESET_ALL}")
+    print(f"{Fore.GREEN}[✓] Starting BugScanX Bot...{Style.RESET_ALL}")
     print(f"{Fore.YELLOW}[!] Bot Token: {BOT_TOKEN[:10]}...{Style.RESET_ALL}")
     print(f"{Fore.YELLOW}[!] Admin IDs: {ADMIN_IDS}{Style.RESET_ALL}")
     print(f"{Fore.GREEN}[✓] Sources: {len(SOURCES)}{Style.RESET_ALL}")
     
-    # Create application
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # Add handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("scrape", scrape_command))
+    app.add_handler(CommandHandler("scan", scan_command))
+    app.add_handler(CommandHandler("cidr", cidr_command))
+    app.add_handler(CommandHandler("subdomains", subdomains_command))
+    app.add_handler(CommandHandler("ports", ports_command))
+    app.add_handler(CommandHandler("bulk", bulk_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_bulk))
     
-    # Start bot
     print(f"{Fore.GREEN}[✓] Bot is running!{Style.RESET_ALL}")
     app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    main() 
