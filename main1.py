@@ -507,7 +507,7 @@ async def ports_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = context.args[0]
     msg = await update.message.reply_text(f"🔌 *Scanning ports on:* `{target}`\n⏳ Please wait...", parse_mode=ParseMode.MARKDOWN)
     
-        try:
+    try: 
         # Resolve domain to IP if needed
         if not re.match(r'^\d+\.\d+\.\d+\.\d+$', target):
             ip = socket.gethostbyname(target)
