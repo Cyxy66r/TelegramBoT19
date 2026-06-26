@@ -19,7 +19,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = 'TELEGRAM_BOT_TOKEN_ADD'
+BOT_TOKEN = '8919629019:AAHD2e7b5L7LKshB6-5lCVG5V0r1I__J5YQ'
 API_URL = f'https://api.telegram.org/bot{BOT_TOKEN}/'
 
 # API Endpoints
